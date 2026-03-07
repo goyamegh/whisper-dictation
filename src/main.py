@@ -124,7 +124,7 @@ class WhisperDictationApp(rumps.App):
         self.title = "🎙️ (Loading...)"
         self.status_item.title = "Status: Loading Whisper model..."
         try:
-            self.model = faster_whisper.WhisperModel("medium.en")
+            self.model = faster_whisper.WhisperModel("medium.en", compute_type="int8")
             self.title = "🎙️"
             self.status_item.title = "Status: Ready"
             logger.info("Whisper model loaded successfully!")
@@ -268,7 +268,7 @@ class WhisperDictationApp(rumps.App):
         
         # Transcribe with Whisper
         try:
-            segments, _ = self.model.transcribe(temp_filename, beam_size=5)
+            segments, _ = self.model.transcribe(temp_filename, beam_size=2, best_of=1, vad_filter=True)
             
             text = ""
             for segment in segments:
