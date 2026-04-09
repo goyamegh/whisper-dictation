@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+import platform
+import sys
 import time
 import threading
 import pyaudio
@@ -7,6 +9,10 @@ import numpy as np
 import rumps
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
+if platform.machine() != "arm64":
+    print("Error: mlx-whisper requires Apple Silicon (arm64). This Mac appears to be Intel-based.")
+    print("Please use the 'faster-whisper' backend instead.")
+    sys.exit(1)
 import mlx_whisper
 import signal
 from text_selection import TextSelection
@@ -133,6 +139,12 @@ class WhisperDictationApp(rumps.App):
             if hasattr(self, 'recording_thread') and self.recording_thread.is_alive():
                 self.recording_thread.join(timeout=1.0)
 
+        # Stop chunked transcription thread if it is running
+        if hasattr(self, 'chunked_stop'):
+            self.chunked_stop.set()
+        if hasattr(self, 'chunk_thread') and self.chunk_thread.is_alive():
+            self.chunk_thread.join(timeout=1.0)
+
         # Close PyAudio
         if hasattr(self, 'audio'):
             try:
@@ -217,11 +229,11 @@ class WhisperDictationApp(rumps.App):
         """Discard current recording without processing (held too short)"""
         self.recording = False
         if hasattr(self, 'recording_thread') and self.recording_thread.is_alive():
-            self.recording_thread.join(timeout=0.5)
-        # Stop chunked transcription if running
+            self.recording_thread.join()
+        # Stop chunked transcription and wait for it to fully exit
         self.chunked_stop.set()
         if hasattr(self, 'chunk_thread') and self.chunk_thread.is_alive():
-            self.chunk_thread.join(timeout=2.0)
+            self.chunk_thread.join()
         self.frames = []
         self.indicator.stop()
         self.title = "🎙️"
@@ -329,10 +341,12 @@ class WhisperDictationApp(rumps.App):
         if hasattr(self, 'recording_thread'):
             self.recording_thread.join()
 
-        # Stop chunked transcription and wait for it to finish
+        # Stop chunked transcription and wait for it to fully finish
+        # before starting the final transcription pass to avoid concurrent
+        # model execution and races on shared transcription state
         self.chunked_stop.set()
         if hasattr(self, 'chunk_thread'):
-            self.chunk_thread.join(timeout=5.0)
+            self.chunk_thread.join()
 
         # Hide recording indicator
         self.indicator.stop()
