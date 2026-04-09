@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 import os
 import time
-import tempfile
 import threading
 import pyaudio
-import wave
 import numpy as np
 import rumps
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
-import faster_whisper
+import mlx_whisper
 import signal
 from text_selection import TextSelection
 from bedrock_client import BedrockClient
@@ -61,7 +59,7 @@ class WhisperDictationApp(rumps.App):
         self.indicator.set_app_reference(self)
 
         # Initialize Whisper model
-        self.model = None
+        self.model_loaded = False
         self.load_model_thread = threading.Thread(target=self.load_model)
         self.load_model_thread.start()
         
@@ -70,6 +68,12 @@ class WhisperDictationApp(rumps.App):
         self.channels = 1
         self.rate = 16000
         self.chunk = 1024
+
+        # Chunked transcription state
+        self.partial_text = ""
+        self.last_transcribed_frame_count = 0
+        self.chunked_stop = threading.Event()
+        self.CHUNK_INTERVAL_SECONDS = 5
         
         # Hotkey configuration - we'll listen for globe/fn key (vk=63)
         self.trigger_key = 63  # Key code for globe/fn key
@@ -123,12 +127,20 @@ class WhisperDictationApp(rumps.App):
     def load_model(self):
         self.title = "🎙️ (Loading...)"
         self.status_item.title = "Status: Loading Whisper model..."
+        self.model_path = "mlx-community/whisper-medium.en-mlx"
         try:
-            self.model = faster_whisper.WhisperModel("medium.en", compute_type="int8")
+            # Warm up the model by running a short silent transcription
+            load_start = time.time()
+            dummy_audio = np.zeros(16000, dtype=np.float32)  # 1 second of silence
+            mlx_whisper.transcribe(dummy_audio, path_or_hf_repo=self.model_path)
+            load_elapsed = time.time() - load_start
+            self.model_loaded = True
             self.title = "🎙️"
             self.status_item.title = "Status: Ready"
+            logger.info(f"[METRICS] Model load + warm-up: {load_elapsed*1000:.0f}ms")
             logger.info("Whisper model loaded successfully!")
         except Exception as e:
+            self.model_loaded = False
             self.title = "🎙️ (Error)"
             self.status_item.title = "Status: Error loading model"
             logger.error(f"Error loading model: {e}")
@@ -181,13 +193,16 @@ class WhisperDictationApp(rumps.App):
             sender.title = "Start Recording"
     
     def start_recording(self):
-        if not hasattr(self, 'model') or self.model is None:
+        if not getattr(self, 'model_loaded', False):
             logger.warning("Model not loaded. Please wait for the model to finish loading.")
             self.status_item.title = "Status: Waiting for model to load"
             return
 
         self.frames = []
         self.recording = True
+        self.partial_text = ""
+        self.last_transcribed_frame_count = 0
+        self.chunked_stop.clear()
 
         # Update UI
         self.title = "🎙️ (Recording)"
@@ -200,11 +215,20 @@ class WhisperDictationApp(rumps.App):
         # Start recording thread
         self.recording_thread = threading.Thread(target=self.record_audio)
         self.recording_thread.start()
+
+        # Start chunked transcription thread
+        self.chunk_thread = threading.Thread(target=self.chunked_transcribe_loop)
+        self.chunk_thread.start()
     
     def stop_recording(self):
         self.recording = False
         if hasattr(self, 'recording_thread'):
             self.recording_thread.join()
+
+        # Stop chunked transcription and wait for it to finish
+        self.chunked_stop.set()
+        if hasattr(self, 'chunk_thread'):
+            self.chunk_thread.join(timeout=5.0)
 
         # Hide recording indicator
         self.indicator.stop()
@@ -247,52 +271,123 @@ class WhisperDictationApp(rumps.App):
         stream.stop_stream()
         stream.close()
     
+    def chunked_transcribe_loop(self):
+        """Periodically transcribe accumulated audio while recording."""
+        frames_per_interval = (self.rate * self.CHUNK_INTERVAL_SECONDS) // self.chunk
+
+        while not self.chunked_stop.is_set():
+            self.chunked_stop.wait(timeout=0.5)
+            if self.chunked_stop.is_set():
+                break
+
+            current_frame_count = len(self.frames)
+            new_frames = current_frame_count - self.last_transcribed_frame_count
+            if new_frames < frames_per_interval:
+                continue
+
+            frames_snapshot = list(self.frames[:current_frame_count])
+            if not frames_snapshot:
+                continue
+
+            try:
+                audio_data = np.frombuffer(b''.join(frames_snapshot), dtype=np.int16)
+                audio_float = audio_data.astype(np.float32) / 32768.0
+                audio_duration = len(audio_float) / self.rate
+
+                chunk_start = time.time()
+                result = mlx_whisper.transcribe(
+                    audio_float,
+                    path_or_hf_repo=self.model_path,
+                    temperature=0.0,
+                    condition_on_previous_text=True,
+                )
+                chunk_elapsed = time.time() - chunk_start
+
+                text = result.get("text", "").strip()
+                logger.info(f"[METRICS] Chunk transcription: {chunk_elapsed*1000:.0f}ms "
+                            f"(audio: {audio_duration:.2f}s, RTF: {chunk_elapsed/audio_duration:.2f}x)")
+
+                self.partial_text = text
+                self.last_transcribed_frame_count = current_frame_count
+            except Exception as e:
+                logger.error(f"Error in chunked transcription: {e}")
+
     def transcribe_audio(self):
         if not self.frames:
             self.title = "🎙️"
             self.status_item.title = "Status: No audio recorded"
             logger.warning("No audio recorded")
             return
-            
-        # Save the recorded audio to a temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-            temp_filename = temp_file.name
-        
-        with wave.open(temp_filename, 'wb') as wf:
-            wf.setnchannels(self.channels)
-            wf.setsampwidth(self.audio.get_sample_size(self.format))
-            wf.setframerate(self.rate)
-            wf.writeframes(b''.join(self.frames))
-        
-        logger.debug("Audio saved to temporary file. Transcribing...")
-        
-        # Transcribe with Whisper
+
+        pipeline_start = time.time()
+
+        total_frame_count = len(self.frames)
+        audio_data = np.frombuffer(b''.join(self.frames), dtype=np.int16)
+        audio_float = audio_data.astype(np.float32) / 32768.0
+        audio_duration = len(audio_float) / self.rate
+
+        convert_elapsed = time.time() - pipeline_start
+        logger.info(f"[METRICS] Audio duration: {audio_duration:.2f}s | Buffer conversion: {convert_elapsed*1000:.0f}ms")
+
         try:
-            segments, _ = self.model.transcribe(temp_filename, beam_size=2, best_of=1, vad_filter=True)
-            
-            text = ""
-            for segment in segments:
-                text += segment.text
-            
+            has_partial = bool(self.partial_text) and self.last_transcribed_frame_count > 0
+
+            if has_partial and self.last_transcribed_frame_count >= total_frame_count:
+                # All audio already transcribed by chunked loop
+                text = self.partial_text
+                logger.info(f"[METRICS] Using cached transcription (no tail to process)")
+            elif has_partial:
+                tail_samples = total_frame_count - self.last_transcribed_frame_count
+                tail_duration = (tail_samples * self.chunk) / self.rate
+                if tail_duration < 0.5:
+                    text = self.partial_text
+                    logger.info(f"[METRICS] Tail too short ({tail_duration:.2f}s), using partial result")
+                else:
+                    # Re-transcribe full audio for best accuracy at boundaries
+                    transcribe_start = time.time()
+                    result = mlx_whisper.transcribe(
+                        audio_float,
+                        path_or_hf_repo=self.model_path,
+                        temperature=0.0,
+                        condition_on_previous_text=True,
+                    )
+                    transcribe_elapsed = time.time() - transcribe_start
+                    text = result.get("text", "").strip()
+                    logger.info(f"[METRICS] Final transcription (with tail): {transcribe_elapsed*1000:.0f}ms | RTF: {transcribe_elapsed/audio_duration:.2f}x")
+            else:
+                # No partial results (short recording) — full transcription
+                transcribe_start = time.time()
+                result = mlx_whisper.transcribe(
+                    audio_float,
+                    path_or_hf_repo=self.model_path,
+                    temperature=0.0,
+                    condition_on_previous_text=True,
+                )
+                transcribe_elapsed = time.time() - transcribe_start
+                text = result.get("text", "").strip()
+                logger.info(f"[METRICS] Full transcription (no partials): {transcribe_elapsed*1000:.0f}ms | RTF: {transcribe_elapsed/audio_duration:.2f}x")
+
             if text:
-                #  What does this look like?
                 selected_text = self.text_selector.get_selected_text()
                 logger.debug(f"Selected text: {selected_text}")
-                
+
                 if selected_text and self.bedrock_client.is_available():
                     logger.info(f"Selected text detected: {selected_text[:50]}...")
                     logger.info(f"Voice instruction: {text}")
-                    
+
                     try:
                         # Use Bedrock to enhance the selected text
                         self.status_item.title = "Status: Enhancing text with AI..."
+                        enhance_start = time.time()
                         enhanced_text = self.bedrock_client.enhance_text(text, selected_text)
-                        
+                        enhance_elapsed = time.time() - enhance_start
+                        logger.info(f"[METRICS] AI enhancement: {enhance_elapsed*1000:.0f}ms")
+
                         # Replace selected text with enhanced version
                         self.text_selector.replace_selected_text(enhanced_text)
                         logger.info(f"Enhanced text: {enhanced_text}")
                         self.status_item.title = f"Status: Enhanced: {enhanced_text[:30]}..."
-                        
+
                     except Exception as e:
                         logger.error(f"Error enhancing text: {e}")
                         # Fallback to normal text insertion
@@ -301,19 +396,22 @@ class WhisperDictationApp(rumps.App):
                         self.status_item.title = f"Status: Transcribed: {text[:30]}..."
                 else:
                     # No selected text or Bedrock unavailable - normal insertion
+                    insert_start = time.time()
                     self.insert_text(text)
+                    insert_elapsed = time.time() - insert_start
+                    logger.info(f"[METRICS] Text insertion: {insert_elapsed*1000:.0f}ms")
                     logger.info(f"Transcription: {text}")
                     self.status_item.title = f"Status: Transcribed: {text[:30]}..."
             else:
                 logger.warning("No speech detected")
                 self.status_item.title = "Status: No speech detected"
+
+            total_elapsed = time.time() - pipeline_start
+            logger.info(f"[METRICS] Total pipeline: {total_elapsed*1000:.0f}ms (audio: {audio_duration:.2f}s)")
         except Exception as e:
             logger.error(f"Transcription error: {e}")
             self.status_item.title = "Status: Transcription error"
             raise
-        finally:
-            # Clean up the temporary file
-            os.unlink(temp_filename)
     
     def insert_text(self, text):
         # Type text at cursor position without altering the clipboard
