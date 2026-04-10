@@ -492,9 +492,12 @@ class WhisperDictationApp(rumps.App):
                 logger.info(f"[METRICS] Full transcription (no partials): {transcribe_elapsed*1000:.0f}ms | RTF: {transcribe_elapsed/audio_duration:.2f}x")
 
             if text:
-                # Check for selected text to potentially enhance
-                selected_text = self.text_selector.get_selected_text()
-                logger.debug(f"Selected text: {selected_text}")
+                # Only check for selected text if Bedrock is available for enhancement;
+                # otherwise skip the Cmd+C simulation which can leak a 'c' character
+                selected_text = None
+                if self.bedrock_client.is_available():
+                    selected_text = self.text_selector.get_selected_text()
+                    logger.debug(f"Selected text: {selected_text}")
 
                 if selected_text and self.bedrock_client.is_available():
                     logger.info(f"Selected text detected: {selected_text[:50]}...")
