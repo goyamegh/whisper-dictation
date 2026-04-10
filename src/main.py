@@ -492,10 +492,13 @@ class WhisperDictationApp(rumps.App):
                 logger.info(f"[METRICS] Full transcription (no partials): {transcribe_elapsed*1000:.0f}ms | RTF: {transcribe_elapsed/audio_duration:.2f}x")
 
             if text:
-                # Only check for selected text if Bedrock is available for enhancement;
-                # otherwise skip the Cmd+C simulation which can leak a 'c' character
+                # Only attempt selected-text detection when text enhancement
+                # is explicitly enabled.  The detection simulates Cmd+C which
+                # can leak a literal 'c' into the target app, so it must be
+                # gated behind an opt-in flag.
+                enable_enhance = os.getenv('ENABLE_TEXT_ENHANCEMENT', 'false').lower() == 'true'
                 selected_text = None
-                if self.bedrock_client.is_available():
+                if enable_enhance and self.bedrock_client.is_available():
                     selected_text = self.text_selector.get_selected_text()
                     logger.debug(f"Selected text: {selected_text}")
 
