@@ -155,7 +155,20 @@ class WhisperDictationApp(rumps.App):
     def load_model(self):
         self.title = "🎙️ (Loading...)"
         self.status_item.title = "Status: Loading Whisper model..."
-        self.model_path = "mlx-community/whisper-medium.en-mlx"
+        self.model_path = "mlx-community/distil-whisper-large-v3"
+        self.initial_prompt = (
+            "This is a voice dictation for software engineering work. "
+            "Common terms include: AWS, Amazon Web Services, Bedrock, Lambda, S3, EC2, ECS, EKS, "
+            "CloudFormation, CloudWatch, DynamoDB, SQS, SNS, IAM, VPC, API Gateway, "
+            "Python, JavaScript, TypeScript, React, Node.js, Docker, Kubernetes, "
+            "Git, GitHub, pull request, commit, merge, branch, CI/CD, "
+            "JSON, YAML, REST, GraphQL, HTTP, HTTPS, SSL, TLS, OAuth, JWT, "
+            "Redis, PostgreSQL, MongoDB, Kafka, Terraform, CDK, "
+            "VS Code, IntelliJ, PyCharm, Xcode, macOS, Linux, Ubuntu, "
+            "Claude, Anthropic, OpenAI, GPT, LLM, MLX, Whisper, "
+            "oncall, ticket, deployment, rollback, pipeline, microservice, "
+            "async, await, callback, promise, thread, mutex, semaphore."
+        )
         try:
             # Warm up the model by running a short silent transcription
             load_start = time.time()
@@ -422,8 +435,10 @@ class WhisperDictationApp(rumps.App):
                 result = mlx_whisper.transcribe(
                     audio_float,
                     path_or_hf_repo=self.model_path,
+                    language="en",
+                    initial_prompt=self.initial_prompt,
                     temperature=0.0,
-                    condition_on_previous_text=True,
+                    condition_on_previous_text=False,
                 )
                 chunk_elapsed = time.time() - chunk_start
 
@@ -472,6 +487,8 @@ class WhisperDictationApp(rumps.App):
                     result = mlx_whisper.transcribe(
                         audio_float,
                         path_or_hf_repo=self.model_path,
+                        language="en",
+                        initial_prompt=self.initial_prompt,
                         temperature=0.0,
                         condition_on_previous_text=True,
                     )
@@ -484,6 +501,8 @@ class WhisperDictationApp(rumps.App):
                 result = mlx_whisper.transcribe(
                     audio_float,
                     path_or_hf_repo=self.model_path,
+                    language="en",
+                    initial_prompt=self.initial_prompt,
                     temperature=0.0,
                     condition_on_previous_text=True,
                 )
