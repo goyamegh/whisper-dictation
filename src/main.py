@@ -51,6 +51,7 @@ class WhisperDictationApp(rumps.App):
         self.recording = False
         self.audio = pyaudio.PyAudio()
         self.frames = []
+        self.frames_lock = threading.Lock()
         self.keyboard_controller = Controller()
 
         # Microphone selection (None = use default)
@@ -149,7 +150,7 @@ class WhisperDictationApp(rumps.App):
         if hasattr(self, 'audio'):
             try:
                 self.audio.terminate()
-            except:
+            except Exception:
                 pass
 
     def load_model(self):
@@ -167,7 +168,8 @@ class WhisperDictationApp(rumps.App):
             "VS Code, IntelliJ, PyCharm, Xcode, macOS, Linux, Ubuntu, "
             "Claude, Anthropic, OpenAI, GPT, LLM, MLX, Whisper, "
             "oncall, ticket, deployment, rollback, pipeline, microservice, "
-            "async, await, callback, promise, thread, mutex, semaphore."
+            "async, await, callback, promise, thread, mutex, semaphore, "
+            "OTEL, OpenTelemetry, observability, tracing, metrics, spans."
         )
         try:
             # Warm up the model by running a short silent transcription
@@ -242,12 +244,13 @@ class WhisperDictationApp(rumps.App):
         """Discard current recording without processing (held too short)"""
         self.recording = False
         if hasattr(self, 'recording_thread') and self.recording_thread.is_alive():
-            self.recording_thread.join()
+            self.recording_thread.join(timeout=5.0)
         # Stop chunked transcription and wait for it to fully exit
         self.chunked_stop.set()
         if hasattr(self, 'chunk_thread') and self.chunk_thread.is_alive():
-            self.chunk_thread.join()
-        self.frames = []
+            self.chunk_thread.join(timeout=10.0)
+        with self.frames_lock:
+            self.frames = []
         self.indicator.stop()
         self.title = "🎙️"
         self.status_item.title = "Status: Recording discarded (too short)"
@@ -327,7 +330,8 @@ class WhisperDictationApp(rumps.App):
             self.status_item.title = "Status: Waiting for model to load"
             return
 
-        self.frames = []
+        with self.frames_lock:
+            self.frames = []
         self.recording = True
         self.partial_text = ""
         self.last_transcribed_frame_count = 0
@@ -397,16 +401,17 @@ class WhisperDictationApp(rumps.App):
             stream_kwargs['input_device_index'] = self.selected_input_device
 
         stream = self.audio.open(**stream_kwargs)
+        try:
+            while self.recording:
+                data = stream.read(self.chunk)
+                with self.frames_lock:
+                    self.frames.append(data)
 
-        while self.recording:
-            data = stream.read(self.chunk)
-            self.frames.append(data)
-
-            # Update indicator with audio level
-            self.indicator.update_audio_level(data)
-
-        stream.stop_stream()
-        stream.close()
+                # Update indicator with audio level
+                self.indicator.update_audio_level(data)
+        finally:
+            stream.stop_stream()
+            stream.close()
 
     def chunked_transcribe_loop(self):
         """Periodically transcribe accumulated audio while recording."""
@@ -417,12 +422,12 @@ class WhisperDictationApp(rumps.App):
             if self.chunked_stop.is_set():
                 break
 
-            current_frame_count = len(self.frames)
-            new_frames = current_frame_count - self.last_transcribed_frame_count
-            if new_frames < frames_per_interval:
-                continue
-
-            frames_snapshot = list(self.frames[:current_frame_count])
+            with self.frames_lock:
+                current_frame_count = len(self.frames)
+                new_frames = current_frame_count - self.last_transcribed_frame_count
+                if new_frames < frames_per_interval:
+                    continue
+                frames_snapshot = list(self.frames[:current_frame_count])
             if not frames_snapshot:
                 continue
 
@@ -443,8 +448,9 @@ class WhisperDictationApp(rumps.App):
                 chunk_elapsed = time.time() - chunk_start
 
                 text = result.get("text", "").strip()
+                rtf = chunk_elapsed / audio_duration if audio_duration > 0 else 0
                 logger.info(f"[METRICS] Chunk transcription: {chunk_elapsed*1000:.0f}ms "
-                            f"(audio: {audio_duration:.2f}s, RTF: {chunk_elapsed/audio_duration:.2f}x)")
+                            f"(audio: {audio_duration:.2f}s, RTF: {rtf:.2f}x)")
 
                 self.partial_text = text
                 self.last_transcribed_frame_count = current_frame_count
@@ -452,16 +458,16 @@ class WhisperDictationApp(rumps.App):
                 logger.error(f"Error in chunked transcription: {e}")
 
     def transcribe_audio(self):
-        if not self.frames:
-            self.title = "🎙️"
-            self.status_item.title = "Status: No audio recorded"
-            logger.warning("No audio recorded")
-            return
+        with self.frames_lock:
+            if not self.frames:
+                self.title = "🎙️"
+                self.status_item.title = "Status: No audio recorded"
+                logger.warning("No audio recorded")
+                return
+            total_frame_count = len(self.frames)
+            audio_data = np.frombuffer(b''.join(self.frames), dtype=np.int16)
 
         pipeline_start = time.time()
-
-        total_frame_count = len(self.frames)
-        audio_data = np.frombuffer(b''.join(self.frames), dtype=np.int16)
         audio_float = audio_data.astype(np.float32) / 32768.0
         audio_duration = len(audio_float) / self.rate
 
@@ -494,7 +500,8 @@ class WhisperDictationApp(rumps.App):
                     )
                     transcribe_elapsed = time.time() - transcribe_start
                     text = result.get("text", "").strip()
-                    logger.info(f"[METRICS] Final transcription (with tail): {transcribe_elapsed*1000:.0f}ms | RTF: {transcribe_elapsed/audio_duration:.2f}x")
+                    rtf = transcribe_elapsed / audio_duration if audio_duration > 0 else 0
+                    logger.info(f"[METRICS] Final transcription (with tail): {transcribe_elapsed*1000:.0f}ms | RTF: {rtf:.2f}x")
             else:
                 # No partial results (short recording) — full transcription
                 transcribe_start = time.time()
@@ -508,7 +515,8 @@ class WhisperDictationApp(rumps.App):
                 )
                 transcribe_elapsed = time.time() - transcribe_start
                 text = result.get("text", "").strip()
-                logger.info(f"[METRICS] Full transcription (no partials): {transcribe_elapsed*1000:.0f}ms | RTF: {transcribe_elapsed/audio_duration:.2f}x")
+                rtf = transcribe_elapsed / audio_duration if audio_duration > 0 else 0
+                logger.info(f"[METRICS] Full transcription (no partials): {transcribe_elapsed*1000:.0f}ms | RTF: {rtf:.2f}x")
 
             if text:
                 # Only attempt selected-text detection when text enhancement
